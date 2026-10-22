@@ -195,6 +195,17 @@ const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 
+/**
+ * The idle window of a run-scoped MCP gateway token.
+ *
+ * A run token's expiry is an idle timeout, not an absolute lifetime: every
+ * authenticated use slides it forward, so the token stays usable for as long
+ * as the run keeps using it. The window is how long a run token may sit
+ * unused before the reaper deletes it. Operator-minted tokens
+ * (`gateway_client`) keep an absolute expiry and are never refreshed.
+ */
+export const HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS = 4 * 60 * 60 * 1_000;
+
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
   actingUserId: string | null,
@@ -1810,7 +1821,9 @@ export function createToolGatewayService(
         : input.action === "tool_gateway.session_revoked"
           ? "session_revoked"
           : input.action === "tool_gateway.call_allowed" ||
-              input.action === "tool_gateway.session_created"
+              input.action === "tool_gateway.session_created" ||
+              input.action === "tool_gateway.token_created" ||
+              input.action === "tool_gateway.token_refreshed"
             ? "policy_decision"
             : input.action === "tool_gateway.call_completed"
               ? "call_completed"
@@ -7010,6 +7023,52 @@ export function createToolGatewayService(
     }
   }
 
+  // activity_log.run_id is a hard foreign key to heartbeat_runs.id. A token
+  // subject is a run id, but a run token outlives the run that minted it, and
+  // the run row is not always there -- upstream mints run tokens for a run id
+  // it does not persist. The foreign key column is filled only when the run
+  // row exists; the run id always stays in the audit details.
+  async function auditRunId(
+    companyId: string,
+    runId: string | null,
+  ): Promise<string | null> {
+    if (!runId) return null;
+    const [row] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, companyId),
+        ),
+      )
+      .limit(1);
+    return row?.id ?? null;
+  }
+
+  // A reaped run token keeps its place in the "run token expired" class. The
+  // reaper deletes the token row once the idle window lapses, so what the
+  // token was is only knowable from the audit row written when it was minted.
+  async function namedGatewayTokenSubject(input: {
+    companyId: string;
+    tokenId: string;
+  }): Promise<{ subjectType: string; subjectId: string | null } | null> {
+    const [row] = await db
+      .select({
+        subjectType: sql<string | null>`${toolAccessAuditEvents.details}->>'subjectType'`,
+        subjectId: sql<string | null>`${toolAccessAuditEvents.details}->>'subjectId'`,
+      })
+      .from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.companyId, input.companyId),
+        eq(sql`${toolAccessAuditEvents.details}->>'source'`, "tool_gateway.token_created"),
+        eq(sql`${toolAccessAuditEvents.details}->>'gatewayTokenId'`, input.tokenId),
+      ))
+      .limit(1);
+    if (!row?.subjectType) return null;
+    return { subjectType: row.subjectType, subjectId: row.subjectId };
+  }
+
   async function recordNamedGatewayAuthFailure(input: {
     gatewayId?: string | null;
     gatewayPublicId?: string | null;
@@ -7032,6 +7091,21 @@ export function createToolGatewayService(
         "Gateway bearer token is expired or invalid",
         input.reasonCode,
       );
+    }
+    // "Run token expired" stays one queryable class: a reaped run token
+    // reports the same reason code as a token that is present but past its
+    // expiry, and `reaped` says which of the two it was.
+    let reasonCode = input.reasonCode;
+    let reaped = false;
+    if (reasonCode === "gateway_token_invalid" && tokenId) {
+      const minted = await namedGatewayTokenSubject({
+        companyId: gateway.companyId,
+        tokenId,
+      });
+      if (minted?.subjectType === "heartbeat_run") {
+        reasonCode = "gateway_token_expired";
+        reaped = true;
+      }
     }
     const gatewayState = await consumeProtocolRateLimit({
       companyId: gateway.companyId,
@@ -7083,7 +7157,7 @@ export function createToolGatewayService(
           reasonText:
             "The MCP gateway authentication attempt was throttled after repeated failures.",
           limiterKeyClass,
-          failedReasonCode: input.reasonCode,
+          failedReasonCode: reasonCode,
           requestCount: count,
           limit: protocolLimits.authFailures.max,
           windowMs: protocolLimits.authFailures.windowMs,
@@ -7110,10 +7184,45 @@ export function createToolGatewayService(
         },
       );
     }
+    // The named-gateway rejection path audits every failure, so "run token
+    // expired" stays one queryable class in the audit trail.
+    await writeAudit({
+      session: {
+        id: `gateway:${gateway.id}`,
+        token: "",
+        companyId: gateway.companyId,
+        agentId: gateway.agentId,
+        runId: null,
+        issueId: gateway.issueId,
+        projectId: gateway.projectId,
+        gatewayId: gateway.id,
+        gatewayPublicId: gateway.gatewayPublicId,
+        gatewayName: gateway.name,
+        gatewayTokenId: tokenId,
+        actorType: "system",
+        actorId: gateway.id,
+        createdAt: new Date(),
+        expiresAt: new Date(),
+      },
+      companyId: gateway.companyId,
+      agentId: gateway.agentId,
+      runId: null,
+      issueId: gateway.issueId,
+      action: "tool_gateway.session_rejected",
+      details: {
+        decision: "deny",
+        reasonCode,
+        reaped,
+        gatewayId: gateway.id,
+        gatewayPublicId: gateway.gatewayPublicId,
+        tokenPrefix: tokenPrefixFromNamedBearer(token),
+        ...input.clientMetadata,
+      },
+    });
     throw new ToolGatewayHttpError(
       401,
       "Gateway bearer token is expired or invalid",
-      input.reasonCode,
+      reasonCode,
     );
   }
 
@@ -7171,7 +7280,63 @@ export function createToolGatewayService(
         clientMetadata,
       });
     }
-    if (row.token.expiresAt && row.token.expiresAt.getTime() <= Date.now()) {
+    // A run token's expiry is an idle timeout, not an absolute lifetime. The
+    // revoked check above already ran, so a revoked token never reaches here.
+    // The write is conditional: only when the remaining lifetime is below half
+    // the window, so the auth path does not write on every authenticated call.
+    const evaluatedAt = options.now?.() ?? Date.now();
+    if (row.token.subjectType === "heartbeat_run" && row.token.expiresAt) {
+      const remainingMs = row.token.expiresAt.getTime() - evaluatedAt;
+      if (remainingMs < HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS / 2) {
+        const previousExpiresAt = row.token.expiresAt;
+        const refreshedExpiresAt = new Date(evaluatedAt + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS);
+        const [refreshed] = await db
+          .update(toolMcpGatewayTokens)
+          .set({ expiresAt: refreshedExpiresAt, updatedAt: new Date(evaluatedAt) })
+          .where(
+            and(
+              eq(toolMcpGatewayTokens.id, row.token.id),
+              eq(toolMcpGatewayTokens.companyId, row.token.companyId),
+            ),
+          )
+          .returning({ expiresAt: toolMcpGatewayTokens.expiresAt });
+        row.token.expiresAt = refreshed?.expiresAt ?? refreshedExpiresAt;
+        await writeAudit({
+          session: {
+            id: `gateway:${row.gateway.id}`,
+            token: "",
+            companyId: row.gateway.companyId,
+            agentId: row.gateway.agentId,
+            runId: row.token.subjectId,
+            issueId: row.gateway.issueId,
+            projectId: row.gateway.projectId,
+            gatewayId: row.gateway.id,
+            gatewayPublicId: row.gateway.gatewayPublicId,
+            gatewayName: row.gateway.name,
+            gatewayTokenId: row.token.id,
+            actorType: "system",
+            actorId: row.gateway.id,
+            createdAt: new Date(evaluatedAt),
+            expiresAt: refreshedExpiresAt,
+          },
+          companyId: row.gateway.companyId,
+          agentId: row.gateway.agentId,
+          runId: await auditRunId(row.token.companyId, row.token.subjectId),
+          issueId: row.gateway.issueId,
+          action: "tool_gateway.token_refreshed",
+          details: {
+            decision: "allow",
+            reasonCode: "run_token_idle_refresh",
+            subjectType: row.token.subjectType,
+            runId: row.token.subjectId,
+            previousExpiresAt: previousExpiresAt.toISOString(),
+            newExpiresAt: row.token.expiresAt.toISOString(),
+            windowMs: HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS,
+          },
+        });
+      }
+    }
+    if (row.token.expiresAt && row.token.expiresAt.getTime() <= evaluatedAt) {
       await recordNamedGatewayAuthFailure({
         gatewayId: input.gatewayId,
         gatewayPublicId: input.gatewayPublicId,
@@ -8993,6 +9158,44 @@ export function createToolGatewayService(
           updatedAt: now,
         })
         .returning();
+      // The reaper deletes a token row once its idle window lapses. This audit
+      // row is the durable record of what the token was, so a reaped run
+      // token is still told apart from an unknown bearer.
+      await writeAudit({
+        session: {
+          id: `gateway:${gateway.id}`,
+          token: "",
+          companyId: gateway.companyId,
+          agentId: gateway.agentId,
+          runId: row.subjectType === "heartbeat_run" ? row.subjectId : null,
+          issueId: gateway.issueId,
+          projectId: gateway.projectId,
+          gatewayId: gateway.id,
+          gatewayPublicId: gateway.gatewayPublicId,
+          gatewayName: gateway.name,
+          gatewayTokenId: row.id,
+          actorType: "system",
+          actorId: gateway.id,
+          createdAt: now,
+          expiresAt: row.expiresAt ?? now,
+        },
+        companyId: gateway.companyId,
+        agentId: gateway.agentId,
+        runId: await auditRunId(
+          gateway.companyId,
+          row.subjectType === "heartbeat_run" ? row.subjectId : null,
+        ),
+        issueId: gateway.issueId,
+        action: "tool_gateway.token_created",
+        details: {
+          decision: "allow",
+          reasonCode: "named_gateway_token_created",
+          subjectType: row.subjectType,
+          subjectId: row.subjectId,
+          runId: row.subjectType === "heartbeat_run" ? row.subjectId : null,
+          expiresAt: row.expiresAt?.toISOString() ?? null,
+        },
+      });
       return { ...toGatewayToken(row), token };
     },
 
