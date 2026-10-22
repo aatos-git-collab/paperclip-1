@@ -570,4 +570,282 @@ describeEmbeddedPostgres("run scoped MCP gateway token idle window", () => {
       reaped: false,
     });
   });
+
+  it("refuses an expired run token whose row is still present", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await createProfile(db, company.id, agent.id);
+    const t0 = Date.now();
+    const clock = createClock(t0);
+    const gateway = createTestToolGatewayService(db, clock.now);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Expired run token gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const expiresAt = t0 - MINUTE_MS;
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Run token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(expiresAt),
+      },
+      actor: { agentId: agent.id },
+    });
+
+    // The idle window is the deadline. A row the reaper has not reached yet
+    // must not buy the run another window of access.
+    clock.set(t0);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: token.token,
+      }),
+      401,
+      "gateway_token_expired",
+    );
+
+    const row = await selectTokenRow(db, token.id);
+    expect(row?.expiresAt?.getTime()).toBe(expiresAt);
+    await expect(
+      selectAuditRows(db, company.id, "tool_gateway.token_refreshed"),
+    ).resolves.toHaveLength(0);
+  });
+
+  it("does not extend the token's life when the request is rejected", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await createProfile(db, company.id, agent.id);
+    const t0 = Date.now();
+    const clock = createClock(t0);
+    const gateway = createTestToolGatewayService(db, clock.now);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Inactive run gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Run token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + LEGACY_RUN_TOKEN_LIFETIME_MS),
+      },
+      actor: { agentId: agent.id },
+    });
+
+    // The run is over, so the request is refused by the run-liveness check.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    // At t+59 minutes less than half the window remains, so a refresh would
+    // have written. A rejected request must not extend the token.
+    clock.set(t0 + 59 * MINUTE_MS);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: token.token,
+      }),
+      401,
+      "gateway_token_run_inactive",
+    );
+
+    const row = await selectTokenRow(db, token.id);
+    expect(row?.expiresAt?.getTime()).toBe(t0 + LEGACY_RUN_TOKEN_LIFETIME_MS);
+    await expect(
+      selectAuditRows(db, company.id, "tool_gateway.token_refreshed"),
+    ).resolves.toHaveLength(0);
+  });
+
+  it("does not search the audit history for a failure that is already throttled", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await createProfile(db, company.id, agent.id);
+    const t0 = Date.now();
+    const clock = createClock(t0);
+    const gateway = createToolGatewayService(db, {
+      now: clock.now,
+      toolActionSigningSecret: testToolActionSigningSecret,
+      mcpGatewayProtocolLimits: {
+        authFailures: { windowMs: 5 * MINUTE_MS, max: 1 },
+      },
+    });
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Throttled gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Run token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + LEGACY_RUN_TOKEN_LIFETIME_MS),
+      },
+      actor: { agentId: agent.id },
+    });
+
+    // The reaper deleted the row, so the token's subject is only knowable
+    // from the audit trail.
+    await db
+      .delete(toolMcpGatewayTokens)
+      .where(eq(toolMcpGatewayTokens.id, token.id));
+
+    // First failure: not throttled, so the audit trail is searched and the
+    // reaped run token is reported in the expired class.
+    clock.set(t0);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: token.token,
+      }),
+      401,
+      "gateway_token_expired",
+    );
+
+    // Second failure: throttled. The audit trail is not searched, so the
+    // throttle row carries the reason code the request arrived with.
+    clock.set(t0 + MINUTE_MS);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: token.token,
+      }),
+      429,
+      "gateway_auth_throttled",
+    );
+
+    const throttledRows = await db
+      .select()
+      .from(toolAccessAuditEvents)
+      .where(
+        and(
+          eq(toolAccessAuditEvents.companyId, company.id),
+          eq(sql`${toolAccessAuditEvents.details}->>'source'`, "tool_gateway.session_rejected"),
+          eq(sql`${toolAccessAuditEvents.details}->>'reasonCode'`, "gateway_auth_throttled"),
+        ),
+      );
+    expect(throttledRows).toHaveLength(1);
+    expect(throttledRows[0]?.details).toMatchObject({
+      reasonCode: "gateway_auth_throttled",
+      failedReasonCode: "gateway_token_invalid",
+    });
+  });
+
+  it("carries the run id into the rejection audit", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await createProfile(db, company.id, agent.id);
+    const t0 = Date.now();
+    const clock = createClock(t0);
+    const gateway = createTestToolGatewayService(db, clock.now);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Run id gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const revokedToken = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Revoked run token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + LEGACY_RUN_TOKEN_LIFETIME_MS),
+      },
+      actor: { agentId: agent.id },
+    });
+    await gateway.revokeNamedGatewayToken({
+      companyId: company.id,
+      tokenId: revokedToken.id,
+      revokedAt: new Date(t0),
+    });
+
+    // The token row is still there, so the run id is known.
+    clock.set(t0);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: revokedToken.token,
+      }),
+      401,
+      "gateway_token_revoked",
+    );
+
+    const reapedToken = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Reaped run token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + LEGACY_RUN_TOKEN_LIFETIME_MS),
+      },
+      actor: { agentId: agent.id },
+    });
+    await db
+      .delete(toolMcpGatewayTokens)
+      .where(eq(toolMcpGatewayTokens.id, reapedToken.id));
+
+    // The token row is gone, so the run id is recovered from the mint audit.
+    clock.set(t0 + MINUTE_MS);
+    await expectGatewayError(
+      gateway.initializeNamedGatewayProtocol({
+        gatewayId: namedGateway.id,
+        bearerToken: reapedToken.token,
+      }),
+      401,
+      "gateway_token_expired",
+    );
+
+    const rejectedRows = await selectAuditRows(
+      db,
+      company.id,
+      "tool_gateway.session_rejected",
+    );
+    expect(rejectedRows).toHaveLength(2);
+    expect(rejectedRows.map((row) => row.details)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reasonCode: "gateway_token_revoked",
+          runId: run.id,
+        }),
+        expect.objectContaining({
+          reasonCode: "gateway_token_expired",
+          reaped: true,
+          runId: run.id,
+        }),
+      ]),
+    );
+  });
 });

@@ -7075,6 +7075,8 @@ export function createToolGatewayService(
     bearerToken: string;
     reasonCode: string;
     clientMetadata: ReturnType<typeof safeClientMetadata>;
+    /** The run this token authorizes, when the caller already knows it. */
+    runId?: string | null;
   }): Promise<never> {
     const token = input.bearerToken.trim();
     const tokenId = namedGatewayTokenId(token);
@@ -7097,16 +7099,9 @@ export function createToolGatewayService(
     // expiry, and `reaped` says which of the two it was.
     let reasonCode = input.reasonCode;
     let reaped = false;
-    if (reasonCode === "gateway_token_invalid" && tokenId) {
-      const minted = await namedGatewayTokenSubject({
-        companyId: gateway.companyId,
-        tokenId,
-      });
-      if (minted?.subjectType === "heartbeat_run") {
-        reasonCode = "gateway_token_expired";
-        reaped = true;
-      }
-    }
+    // The run the token authorizes is carried into the audit details, so a
+    // refusal stays findable by run even when the run row is gone.
+    let rejectedRunId = input.runId ?? null;
     const gatewayState = await consumeProtocolRateLimit({
       companyId: gateway.companyId,
       counterKey: `mcp_gateway_auth_failure:gateway:${gatewayKey}`,
@@ -7158,6 +7153,7 @@ export function createToolGatewayService(
             "The MCP gateway authentication attempt was throttled after repeated failures.",
           limiterKeyClass,
           failedReasonCode: reasonCode,
+          runId: rejectedRunId,
           requestCount: count,
           limit: protocolLimits.authFailures.max,
           windowMs: protocolLimits.authFailures.windowMs,
@@ -7183,6 +7179,23 @@ export function createToolGatewayService(
           ),
         },
       );
+    }
+    // The audit-history lookup runs after the limiter. It is an unindexed
+    // search, so it is paid only by a failure that is not already being
+    // throttled, and a caller that floods the gateway cannot make the server
+    // search the audit trail on every attempt.
+    if (reasonCode === "gateway_token_invalid" && tokenId) {
+      const minted = await namedGatewayTokenSubject({
+        companyId: gateway.companyId,
+        tokenId,
+      });
+      if (minted?.subjectType === "heartbeat_run") {
+        reasonCode = "gateway_token_expired";
+        reaped = true;
+        if (!rejectedRunId && minted.subjectId && uuidPattern.test(minted.subjectId)) {
+          rejectedRunId = minted.subjectId;
+        }
+      }
     }
     // The named-gateway rejection path audits every failure, so "run token
     // expired" stays one queryable class in the audit trail.
@@ -7213,6 +7226,7 @@ export function createToolGatewayService(
         decision: "deny",
         reasonCode,
         reaped,
+        runId: rejectedRunId,
         gatewayId: gateway.id,
         gatewayPublicId: gateway.gatewayPublicId,
         tokenPrefix: tokenPrefixFromNamedBearer(token),
@@ -7262,6 +7276,14 @@ export function createToolGatewayService(
         clientMetadata,
       });
     }
+    // The run a heartbeat_run token authorizes, while the token row is still
+    // there. A refusal carries it into the audit details.
+    const tokenSubjectRunId =
+      row.token.subjectType === "heartbeat_run" &&
+      row.token.subjectId &&
+      uuidPattern.test(row.token.subjectId)
+        ? row.token.subjectId
+        : null;
     if (row.gateway.status !== "active") {
       await recordNamedGatewayAuthFailure({
         gatewayId: input.gatewayId,
@@ -7269,6 +7291,7 @@ export function createToolGatewayService(
         bearerToken,
         reasonCode: "gateway_disabled",
         clientMetadata,
+        runId: tokenSubjectRunId,
       });
     }
     if (row.token.revokedAt) {
@@ -7278,13 +7301,150 @@ export function createToolGatewayService(
         bearerToken,
         reasonCode: "gateway_token_revoked",
         clientMetadata,
+        runId: tokenSubjectRunId,
       });
     }
     // A run token's expiry is an idle timeout, not an absolute lifetime. The
     // revoked check above already ran, so a revoked token never reaches here.
-    // The write is conditional: only when the remaining lifetime is below half
-    // the window, so the auth path does not write on every authenticated call.
     const evaluatedAt = options.now?.() ?? Date.now();
+    // An expired token is refused before the refresh is considered. The idle
+    // window is the deadline: a row the reaper has not reached yet must not
+    // buy a run another window of access.
+    if (row.token.expiresAt && row.token.expiresAt.getTime() <= evaluatedAt) {
+      await recordNamedGatewayAuthFailure({
+        gatewayId: input.gatewayId,
+        gatewayPublicId: input.gatewayPublicId,
+        bearerToken,
+        reasonCode: "gateway_token_expired",
+        clientMetadata,
+        runId: tokenSubjectRunId,
+      });
+    }
+    const nativeMetadata = row.gateway.metadata;
+    const [profile] = await db.select({
+      profileKey: toolProfiles.profileKey,
+      status: toolProfiles.status,
+      source: sql<string | null>`${toolProfiles.metadata}->>'source'`,
+      agentId: sql<string | null>`${toolProfiles.metadata}->>'agentId'`,
+      assignmentDigest: sql<string | null>`${toolProfiles.metadata}->>'assignmentDigest'`,
+    }).from(toolProfiles).where(and(
+      eq(toolProfiles.id, row.gateway.profileId),
+      eq(toolProfiles.companyId, row.gateway.companyId),
+    )).limit(1);
+    // The immutable native profile also identifies legacy assignments when an
+    // update has cleared the gateway metadata. Missing metadata must fail closed.
+    const nativeAssignment = Object.hasOwn(nativeMetadata ?? {}, "nativeRuntimeAssignmentDigest") ||
+      profile?.profileKey.startsWith("native:") || profile?.source === "paperclip_runner";
+    const nativeOwner = nativeMetadata?.agentId;
+    if (nativeAssignment && (
+      typeof nativeOwner !== "string" || !uuidPattern.test(nativeOwner) ||
+      typeof nativeMetadata?.nativeRuntimeAssignmentDigest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(nativeMetadata.nativeRuntimeAssignmentDigest) ||
+      (row.gateway.agentId && row.gateway.agentId !== nativeOwner) ||
+      row.token.subjectType !== "heartbeat_run"
+    )) {
+      return recordNamedGatewayAuthFailure({
+        gatewayId: input.gatewayId, gatewayPublicId: input.gatewayPublicId,
+        bearerToken, reasonCode: "gateway_token_run_context_invalid", clientMetadata,
+        runId: tokenSubjectRunId,
+      });
+    }
+    if (nativeAssignment) {
+      if (profile?.status !== "active" || profile.source !== "paperclip_runner" ||
+          profile.agentId !== nativeOwner ||
+          profile.assignmentDigest !== nativeMetadata!.nativeRuntimeAssignmentDigest) {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId, gatewayPublicId: input.gatewayPublicId,
+          bearerToken, reasonCode: "gateway_token_run_context_invalid", clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+    }
+    let agentId = row.gateway.agentId ?? (nativeAssignment ? nativeOwner as string : null);
+    let runId: string | null = null;
+    let responsibleUserId: string | null = null;
+    let issueId = row.gateway.issueId;
+    let projectId = row.gateway.projectId;
+    if (row.token.subjectType === "heartbeat_run") {
+      const tokenRunId = row.token.subjectId;
+      if (!tokenRunId || !uuidPattern.test(tokenRunId)) {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId,
+          gatewayPublicId: input.gatewayPublicId,
+          bearerToken,
+          reasonCode: "gateway_token_run_invalid",
+          clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+      const [run] = await db
+        .select({
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          responsibleUserId: heartbeatRuns.responsibleUserId,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, tokenRunId))
+        .limit(1);
+      if (!run || run.companyId !== row.gateway.companyId) {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId,
+          gatewayPublicId: input.gatewayPublicId,
+          bearerToken,
+          reasonCode: "gateway_token_run_invalid",
+          clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+      if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId,
+          gatewayPublicId: input.gatewayPublicId,
+          bearerToken,
+          reasonCode: "gateway_token_run_inactive",
+          clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+      if (agentId && agentId !== run.agentId) {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId,
+          gatewayPublicId: input.gatewayPublicId,
+          bearerToken,
+          reasonCode: "gateway_token_run_context_invalid",
+          clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+      try {
+        const runContext = await resolveRunContext({
+          companyId: row.gateway.companyId,
+          agentId: run.agentId,
+          runId: tokenRunId,
+          issueId: row.gateway.issueId,
+          projectId: row.gateway.projectId,
+        });
+        agentId = run.agentId;
+        runId = tokenRunId;
+        responsibleUserId = run.responsibleUserId;
+        issueId = runContext.issueId;
+        projectId = runContext.projectId;
+      } catch {
+        return recordNamedGatewayAuthFailure({
+          gatewayId: input.gatewayId,
+          gatewayPublicId: input.gatewayPublicId,
+          bearerToken,
+          reasonCode: "gateway_token_run_context_invalid",
+          clientMetadata,
+          runId: tokenSubjectRunId,
+        });
+      }
+    }
+    // The refresh runs after every check that can reject the request, so a
+    // rejected request never extends the token's life. The write is
+    // conditional: only when the remaining lifetime is below half the window,
+    // so the auth path does not write on every authenticated call.
     if (row.token.subjectType === "heartbeat_run" && row.token.expiresAt) {
       const remainingMs = row.token.expiresAt.getTime() - evaluatedAt;
       if (remainingMs < HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS / 2) {
@@ -7333,129 +7493,6 @@ export function createToolGatewayService(
             newExpiresAt: row.token.expiresAt.toISOString(),
             windowMs: HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS,
           },
-        });
-      }
-    }
-    if (row.token.expiresAt && row.token.expiresAt.getTime() <= evaluatedAt) {
-      await recordNamedGatewayAuthFailure({
-        gatewayId: input.gatewayId,
-        gatewayPublicId: input.gatewayPublicId,
-        bearerToken,
-        reasonCode: "gateway_token_expired",
-        clientMetadata,
-      });
-    }
-    const nativeMetadata = row.gateway.metadata;
-    const [profile] = await db.select({
-      profileKey: toolProfiles.profileKey,
-      status: toolProfiles.status,
-      source: sql<string | null>`${toolProfiles.metadata}->>'source'`,
-      agentId: sql<string | null>`${toolProfiles.metadata}->>'agentId'`,
-      assignmentDigest: sql<string | null>`${toolProfiles.metadata}->>'assignmentDigest'`,
-    }).from(toolProfiles).where(and(
-      eq(toolProfiles.id, row.gateway.profileId),
-      eq(toolProfiles.companyId, row.gateway.companyId),
-    )).limit(1);
-    // The immutable native profile also identifies legacy assignments when an
-    // update has cleared the gateway metadata. Missing metadata must fail closed.
-    const nativeAssignment = Object.hasOwn(nativeMetadata ?? {}, "nativeRuntimeAssignmentDigest") ||
-      profile?.profileKey.startsWith("native:") || profile?.source === "paperclip_runner";
-    const nativeOwner = nativeMetadata?.agentId;
-    if (nativeAssignment && (
-      typeof nativeOwner !== "string" || !uuidPattern.test(nativeOwner) ||
-      typeof nativeMetadata?.nativeRuntimeAssignmentDigest !== "string" ||
-      !/^[a-f0-9]{64}$/.test(nativeMetadata.nativeRuntimeAssignmentDigest) ||
-      (row.gateway.agentId && row.gateway.agentId !== nativeOwner) ||
-      row.token.subjectType !== "heartbeat_run"
-    )) {
-      return recordNamedGatewayAuthFailure({
-        gatewayId: input.gatewayId, gatewayPublicId: input.gatewayPublicId,
-        bearerToken, reasonCode: "gateway_token_run_context_invalid", clientMetadata,
-      });
-    }
-    if (nativeAssignment) {
-      if (profile?.status !== "active" || profile.source !== "paperclip_runner" ||
-          profile.agentId !== nativeOwner ||
-          profile.assignmentDigest !== nativeMetadata!.nativeRuntimeAssignmentDigest) {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId, gatewayPublicId: input.gatewayPublicId,
-          bearerToken, reasonCode: "gateway_token_run_context_invalid", clientMetadata,
-        });
-      }
-    }
-    let agentId = row.gateway.agentId ?? (nativeAssignment ? nativeOwner as string : null);
-    let runId: string | null = null;
-    let responsibleUserId: string | null = null;
-    let issueId = row.gateway.issueId;
-    let projectId = row.gateway.projectId;
-    if (row.token.subjectType === "heartbeat_run") {
-      const tokenRunId = row.token.subjectId;
-      if (!tokenRunId || !uuidPattern.test(tokenRunId)) {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId,
-          gatewayPublicId: input.gatewayPublicId,
-          bearerToken,
-          reasonCode: "gateway_token_run_invalid",
-          clientMetadata,
-        });
-      }
-      const [run] = await db
-        .select({
-          companyId: heartbeatRuns.companyId,
-          agentId: heartbeatRuns.agentId,
-          status: heartbeatRuns.status,
-          responsibleUserId: heartbeatRuns.responsibleUserId,
-        })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, tokenRunId))
-        .limit(1);
-      if (!run || run.companyId !== row.gateway.companyId) {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId,
-          gatewayPublicId: input.gatewayPublicId,
-          bearerToken,
-          reasonCode: "gateway_token_run_invalid",
-          clientMetadata,
-        });
-      }
-      if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId,
-          gatewayPublicId: input.gatewayPublicId,
-          bearerToken,
-          reasonCode: "gateway_token_run_inactive",
-          clientMetadata,
-        });
-      }
-      if (agentId && agentId !== run.agentId) {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId,
-          gatewayPublicId: input.gatewayPublicId,
-          bearerToken,
-          reasonCode: "gateway_token_run_context_invalid",
-          clientMetadata,
-        });
-      }
-      try {
-        const runContext = await resolveRunContext({
-          companyId: row.gateway.companyId,
-          agentId: run.agentId,
-          runId: tokenRunId,
-          issueId: row.gateway.issueId,
-          projectId: row.gateway.projectId,
-        });
-        agentId = run.agentId;
-        runId = tokenRunId;
-        responsibleUserId = run.responsibleUserId;
-        issueId = runContext.issueId;
-        projectId = runContext.projectId;
-      } catch {
-        return recordNamedGatewayAuthFailure({
-          gatewayId: input.gatewayId,
-          gatewayPublicId: input.gatewayPublicId,
-          bearerToken,
-          reasonCode: "gateway_token_run_context_invalid",
-          clientMetadata,
         });
       }
     }
