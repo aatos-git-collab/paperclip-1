@@ -63,6 +63,7 @@ import {
   issueDocuments,
   issueThreadInteractions,
   issues,
+  nativeRunFinalizations,
   projects,
   toolActionRequests,
   toolActionDeliveries,
@@ -206,6 +207,17 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
  */
 export const HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS = 4 * 60 * 60 * 1_000;
 
+/**
+ * How often the run-liveness reaper looks for run-scoped tokens whose run is
+ * over.
+ *
+ * The cadence is the controller lease TTL. A controller lease is what tells a
+ * crashed owner apart from a live one, and a lease is renewed inside a minute,
+ * so a run that dies between two sweeps is still inside a lapsed lease by the
+ * time the next sweep runs.
+ */
+export const GATEWAY_TOKEN_REAP_INTERVAL_MS = 60 * 1_000;
+
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
   actingUserId: string | null,
@@ -255,6 +267,63 @@ const ACTION_REQUEST_EXECUTION_WAIT_MS = APPROVED_EXECUTION_TIMEOUT_MS + 5_000;
 // create) so a live create keeps its own row.
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
+
+/** Why a run-scoped MCP gateway token's run is no longer live.
+ *
+ * `expiresAt` on a `heartbeat_run` token is an idle marker, not a lifetime.
+ * The token's life is the run's life, so the reason the run is over is what
+ * an operator needs to see, and it is carried into the audit trail. */
+export type GatewayRunReapReason =
+  | "run_missing"
+  | "run_company_mismatch"
+  | "run_not_active"
+  | "run_abandoned"
+  | "token_revoked";
+
+export type GatewayRunLiveness = {
+  companyId: string;
+  status: string;
+  runtimeMode?: string | null;
+  controllerBootId?: string | null;
+  controllerLeaseExpiresAt?: Date | null;
+  nativeControllerBootId?: string | null;
+  nativeLeaseExpiresAt?: Date | null;
+};
+
+/** Is the run a `heartbeat_run` token authorizes still live?
+ *
+ * One predicate, used by the auth path and by the reaper, so the two can never
+ * disagree about whether a token should still exist.
+ *
+ * A run whose owner is gone is not coming back. A legacy run holds its
+ * controller lease on the run row; a native run holds its coordinator lease on
+ * the finalization row. A lease that has lapsed is positive evidence that
+ * nobody owns the run any more, and it is what lets a crashed controller's
+ * token be reaped without waiting for the heartbeat scheduler to reclaim the
+ * run. Absent lease data is not evidence of abandonment, so it never reaps.
+ *
+ * Returns null when the run is live. */
+export function gatewayRunReapReason(
+  run: GatewayRunLiveness | null | undefined,
+  tokenCompanyId: string,
+  now: Date,
+): GatewayRunReapReason | null {
+  if (!run) return "run_missing";
+  if (run.companyId !== tokenCompanyId) return "run_company_mismatch";
+  if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) return "run_not_active";
+  const lease =
+    run.runtimeMode === "native"
+      ? run.nativeLeaseExpiresAt
+      : run.controllerLeaseExpiresAt;
+  const leaseOwner =
+    run.runtimeMode === "native"
+      ? run.nativeControllerBootId
+      : run.controllerBootId;
+  if (leaseOwner && lease && lease.getTime() <= now.getTime()) {
+    return "run_abandoned";
+  }
+  return null;
+}
 // A tool listing decides access for every tool in the company. The decisions
 // of one listing share a read cache, so this cap only limits how many of them
 // (and their uncached reads, such as rate-limit counters) run at the same time.
@@ -1823,7 +1892,8 @@ export function createToolGatewayService(
           : input.action === "tool_gateway.call_allowed" ||
               input.action === "tool_gateway.session_created" ||
               input.action === "tool_gateway.token_created" ||
-              input.action === "tool_gateway.token_refreshed"
+              input.action === "tool_gateway.token_refreshed" ||
+              input.action === "tool_gateway.token_reaped"
             ? "policy_decision"
             : input.action === "tool_gateway.call_completed"
               ? "call_completed"
@@ -7304,13 +7374,19 @@ export function createToolGatewayService(
         runId: tokenSubjectRunId,
       });
     }
-    // A run token's expiry is an idle timeout, not an absolute lifetime. The
+    // A run token's expiry is an idle marker, not an absolute lifetime. The
     // revoked check above already ran, so a revoked token never reaches here.
     const evaluatedAt = options.now?.() ?? Date.now();
-    // An expired token is refused before the refresh is considered. The idle
-    // window is the deadline: a row the reaper has not reached yet must not
-    // buy a run another window of access.
-    if (row.token.expiresAt && row.token.expiresAt.getTime() <= evaluatedAt) {
+    // An operator token keeps its absolute expiry and is refused here. A run
+    // token does not: its lifetime is the run's lifetime, and the marker is
+    // only what the refresh slides forward while the run keeps working. A run
+    // token past its marker is refreshed below, once the run has been shown to
+    // be live, so a run is never locked out of a gateway it is still using.
+    if (
+      row.token.subjectType !== "heartbeat_run" &&
+      row.token.expiresAt &&
+      row.token.expiresAt.getTime() <= evaluatedAt
+    ) {
       await recordNamedGatewayAuthFailure({
         gatewayId: input.gatewayId,
         gatewayPublicId: input.gatewayPublicId,
@@ -7382,9 +7458,18 @@ export function createToolGatewayService(
           companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          runtimeMode: heartbeatRuns.runtimeMode,
+          controllerBootId: heartbeatRuns.controllerBootId,
+          controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+          nativeControllerBootId: nativeRunFinalizations.controllerBootId,
+          nativeLeaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
           responsibleUserId: heartbeatRuns.responsibleUserId,
         })
         .from(heartbeatRuns)
+        .leftJoin(
+          nativeRunFinalizations,
+          eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+        )
         .where(eq(heartbeatRuns.id, tokenRunId))
         .limit(1);
       if (!run || run.companyId !== row.gateway.companyId) {
@@ -7397,7 +7482,10 @@ export function createToolGatewayService(
           runId: tokenSubjectRunId,
         });
       }
-      if (!ACTIVE_GATEWAY_RUN_STATUSES.has(run.status)) {
+      // The same predicate the reaper uses, so the auth path and the reaper can
+      // never disagree about whether this token should still exist. An
+      // abandoned run is not coming back, so its token does not outlive it.
+      if (gatewayRunReapReason(run, row.gateway.companyId, new Date(evaluatedAt))) {
         return recordNamedGatewayAuthFailure({
           gatewayId: input.gatewayId,
           gatewayPublicId: input.gatewayPublicId,
@@ -7460,7 +7548,19 @@ export function createToolGatewayService(
             ),
           )
           .returning({ expiresAt: toolMcpGatewayTokens.expiresAt });
-        row.token.expiresAt = refreshed?.expiresAt ?? refreshedExpiresAt;
+        if (!refreshed) {
+          // The row was reaped between the lookup and the write. The token is
+          // gone, so this request does not get to keep it.
+          return recordNamedGatewayAuthFailure({
+            gatewayId: input.gatewayId,
+            gatewayPublicId: input.gatewayPublicId,
+            bearerToken,
+            reasonCode: "gateway_token_invalid",
+            clientMetadata,
+            runId: tokenSubjectRunId,
+          });
+        }
+        row.token.expiresAt = refreshed.expiresAt ?? refreshedExpiresAt;
         await writeAudit({
           session: {
             id: `gateway:${row.gateway.id}`,
@@ -11773,14 +11873,24 @@ export function createToolGatewayService(
 
     async cleanupExpiredSessions(input: { now?: Date } = {}) {
       const now = input.now ?? new Date();
+      // A run token is not collected for its marker. Its life is the run's
+      // life, and `reapGatewayTokensForDeadRuns` is what ends it. An operator
+      // token keeps its absolute expiry and is collected here.
       const expiredTokens = await db.select({ id: toolMcpGatewayTokens.id })
         .from(toolMcpGatewayTokens)
-        .where(lte(toolMcpGatewayTokens.expiresAt, now))
+        .where(and(
+          lte(toolMcpGatewayTokens.expiresAt, now),
+          ne(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
+        ))
         .orderBy(asc(toolMcpGatewayTokens.expiresAt), asc(toolMcpGatewayTokens.id))
         .limit(500);
       if (expiredTokens.length > 0) {
         await db.delete(toolMcpGatewayTokens)
-            .where(and(inArray(toolMcpGatewayTokens.id, expiredTokens.map((token) => token.id)), lte(toolMcpGatewayTokens.expiresAt, now)))
+            .where(and(
+              inArray(toolMcpGatewayTokens.id, expiredTokens.map((token) => token.id)),
+              lte(toolMcpGatewayTokens.expiresAt, now),
+              ne(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
+            ))
             .returning({ id: toolMcpGatewayTokens.id });
       }
       const rows = await db
@@ -11788,6 +11898,159 @@ export function createToolGatewayService(
         .where(lte(toolGatewaySessions.expiresAt, now))
         .returning({ id: toolGatewaySessions.id });
       return { deletedCount: rows.length };
+    },
+
+    // A run-scoped token is reaped by run liveness, not by its marker. The
+    // token's life is the run's life, so a token whose run has ended is
+    // collected whether or not its marker has passed. The sweep is
+    // self-contained: it does not hang off the heartbeat scheduler, so it
+    // holds with the scheduler disabled and on a warm standby.
+    async reapGatewayTokensForDeadRuns(input: { now?: Date } = {}) {
+      const now = input.now ?? new Date();
+      const candidates = await db
+        .select({
+          id: toolMcpGatewayTokens.id,
+          companyId: toolMcpGatewayTokens.companyId,
+          subjectId: toolMcpGatewayTokens.subjectId,
+          revokedAt: toolMcpGatewayTokens.revokedAt,
+          expiresAt: toolMcpGatewayTokens.expiresAt,
+          gatewayId: toolMcpGateways.id,
+          gatewayPublicId: toolMcpGateways.gatewayPublicId,
+          gatewayName: toolMcpGateways.name,
+          gatewayAgentId: toolMcpGateways.agentId,
+          gatewayIssueId: toolMcpGateways.issueId,
+          gatewayProjectId: toolMcpGateways.projectId,
+        })
+        .from(toolMcpGatewayTokens)
+        .innerJoin(
+          toolMcpGateways,
+          eq(toolMcpGatewayTokens.gatewayId, toolMcpGateways.id),
+        )
+        .where(eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"))
+        .orderBy(asc(toolMcpGatewayTokens.createdAt), asc(toolMcpGatewayTokens.id))
+        .limit(500);
+      if (candidates.length === 0) return { reapedCount: 0 };
+      const runIds = [
+        ...new Set(
+          candidates
+            .map((token) => token.subjectId)
+            .filter(
+              (id): id is string =>
+                typeof id === "string" && uuidPattern.test(id),
+            ),
+        ),
+      ];
+      const runs = runIds.length
+        ? await db
+            .select({
+              id: heartbeatRuns.id,
+              companyId: heartbeatRuns.companyId,
+              status: heartbeatRuns.status,
+              runtimeMode: heartbeatRuns.runtimeMode,
+              controllerBootId: heartbeatRuns.controllerBootId,
+              controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+              nativeControllerBootId: nativeRunFinalizations.controllerBootId,
+              nativeLeaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
+            })
+            .from(heartbeatRuns)
+            .leftJoin(
+              nativeRunFinalizations,
+              eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+            )
+            .where(inArray(heartbeatRuns.id, runIds))
+        : [];
+      const runsById = new Map(runs.map((run) => [run.id, run]));
+      const dead = candidates
+        .map((token) => {
+          const run = token.subjectId
+            ? runsById.get(token.subjectId)
+            : undefined;
+          const reason =
+            gatewayRunReapReason(run, token.companyId, now) ??
+            (token.revokedAt ? "token_revoked" : null);
+          return reason ? { token, reason } : null;
+        })
+        .filter(
+          (entry): entry is {
+            token: (typeof candidates)[number];
+            reason: GatewayRunReapReason;
+          } => entry !== null,
+        );
+      if (dead.length === 0) return { reapedCount: 0 };
+      const reaped = await db
+        .delete(toolMcpGatewayTokens)
+        .where(
+          and(
+            inArray(
+              toolMcpGatewayTokens.id,
+              dead.map((entry) => entry.token.id),
+            ),
+            eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
+          ),
+        )
+        .returning({
+          id: toolMcpGatewayTokens.id,
+          companyId: toolMcpGatewayTokens.companyId,
+          subjectId: toolMcpGatewayTokens.subjectId,
+          expiresAt: toolMcpGatewayTokens.expiresAt,
+        });
+      const reasonsById = new Map(
+        dead.map((entry) => [entry.token.id, entry.reason]),
+      );
+      for (const token of reaped) {
+        const candidate = candidates.find((entry) => entry.id === token.id);
+        const gatewayId = candidate?.gatewayId ?? null;
+        // The reaping is its own audit row, so "this token was reaped, and
+        // this is why" is durable and does not have to be inferred from a
+        // missing row.
+        await writeAudit({
+          session: {
+            id: `gateway:${gatewayId ?? token.id}`,
+            token: "",
+            companyId: token.companyId,
+            agentId: candidate?.gatewayAgentId ?? null,
+            runId: token.subjectId,
+            issueId: candidate?.gatewayIssueId ?? null,
+            projectId: candidate?.gatewayProjectId ?? null,
+            gatewayId,
+            gatewayPublicId: candidate?.gatewayPublicId ?? null,
+            gatewayName: candidate?.gatewayName ?? null,
+            gatewayTokenId: token.id,
+            actorType: "system",
+            actorId: gatewayId ?? token.id,
+            createdAt: now,
+            expiresAt: token.expiresAt ?? now,
+          },
+          companyId: token.companyId,
+          agentId: candidate?.gatewayAgentId ?? null,
+          runId: await auditRunId(token.companyId, token.subjectId),
+          issueId: candidate?.gatewayIssueId ?? null,
+          action: "tool_gateway.token_reaped",
+          details: {
+            decision: "allow",
+            reasonCode: "run_token_reaped",
+            reapReason: reasonsById.get(token.id) ?? "run_not_active",
+            subjectType: "heartbeat_run",
+            runId: token.subjectId,
+            gatewayTokenId: token.id,
+            expiresAt: token.expiresAt?.toISOString() ?? null,
+          },
+        });
+      }
+      return { reapedCount: reaped.length };
+    },
+
+    // Whether any run-scoped token still exists. The reaper's duty is quiet
+    // when there is nothing to reap, and this is what lets it stop scanning:
+    // with no run-scoped token there is no credential whose run could have
+    // ended, so there is nothing to check.
+    async hasOutstandingGatewayRunTokens() {
+      const rows = await db
+        .select({ id: toolMcpGatewayTokens.id })
+        .from(toolMcpGatewayTokens)
+        .where(eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"))
+        .limit(1);
+      return rows.length > 0;
     },
 
     async listRuntimeSlots(companyId?: string) {

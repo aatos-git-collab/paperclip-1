@@ -571,7 +571,7 @@ describeEmbeddedPostgres("run scoped MCP gateway token idle window", () => {
     });
   });
 
-  it("refuses an expired run token whose row is still present", async () => {
+  it("refreshes a run token whose marker has passed while the run is still live", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -601,23 +601,23 @@ describeEmbeddedPostgres("run scoped MCP gateway token idle window", () => {
       actor: { agentId: agent.id },
     });
 
-    // The idle window is the deadline. A row the reaper has not reached yet
-    // must not buy the run another window of access.
+    // The marker is the idle timeout, not the token's lifetime. While the run
+    // is live the marker slides forward, so a live run is never locked out of
+    // a gateway it is still using. FUL-140 made the run's liveness the
+    // boundary; the marker stopped being one.
     clock.set(t0);
-    await expectGatewayError(
+    await expect(
       gateway.initializeNamedGatewayProtocol({
         gatewayId: namedGateway.id,
         bearerToken: token.token,
       }),
-      401,
-      "gateway_token_expired",
-    );
+    ).resolves.toMatchObject({ runId: run.id, agentId: agent.id });
 
     const row = await selectTokenRow(db, token.id);
-    expect(row?.expiresAt?.getTime()).toBe(expiresAt);
+    expect(row?.expiresAt?.getTime()).toBe(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS);
     await expect(
       selectAuditRows(db, company.id, "tool_gateway.token_refreshed"),
-    ).resolves.toHaveLength(0);
+    ).resolves.toHaveLength(1);
   });
 
   it("does not extend the token's life when the request is rejected", async () => {
