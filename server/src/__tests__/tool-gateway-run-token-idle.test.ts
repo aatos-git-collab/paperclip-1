@@ -604,7 +604,7 @@ describeEmbeddedPostgres("run scoped MCP gateway token idle window", () => {
     // The marker is the idle timeout, not the token's lifetime. While the run
     // is live the marker slides forward, so a live run is never locked out of
     // a gateway it is still using. FUL-140 made the run's liveness the
-    // boundary; the marker stopped being one.
+    // deadline; the marker stopped being one.
     clock.set(t0);
     await expect(
       gateway.initializeNamedGatewayProtocol({

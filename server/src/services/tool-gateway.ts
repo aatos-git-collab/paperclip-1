@@ -7382,6 +7382,8 @@ export function createToolGatewayService(
     // only what the refresh slides forward while the run keeps working. A run
     // token past its marker is refreshed below, once the run has been shown to
     // be live, so a run is never locked out of a gateway it is still using.
+    // The refresh is only considered once the run is known to be live, and the
+    // deadline that binds the token is the run's, not the marker's.
     if (
       row.token.subjectType !== "heartbeat_run" &&
       row.token.expiresAt &&
