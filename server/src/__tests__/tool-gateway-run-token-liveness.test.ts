@@ -18,6 +18,7 @@ import {
   toolProfileBindings,
   toolProfileEntries,
   toolProfiles,
+  toolRuntimeMetricCounters,
 } from "@paperclipai/db";
 import {
   createToolGatewayService,
@@ -28,6 +29,7 @@ import {
 } from "../services/tool-gateway.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -207,48 +209,77 @@ async function waitFor(
 /**
  * A database whose audit writes fail, so a reaper that deletes before it
  * records can be caught. Every other write behaves normally.
+ *
+ * `successfulWrites` lets the first N audit writes succeed, so a batch can be
+ * rolled back after some of its tokens were already recorded. The observers
+ * report when the transaction is active and when the failure counter is
+ * written, so a counter that competes for the pool while the transaction
+ * still holds its connection can be caught too.
  */
-function createAuditFailingDb(db: Db): Db {
+function createAuditFailingDb(
+  db: Db,
+  options: {
+    successfulWrites?: number;
+    onMetricCounterWrite?: (inTransaction: boolean) => void;
+  } = {},
+): Db {
+  const successfulWrites = options.successfulWrites ?? 0;
+  let auditWrites = 0;
+  let inTransaction = false;
   const transaction = db.transaction.bind(db) as (
     callback: (tx: unknown) => Promise<unknown>,
   ) => Promise<unknown>;
+  const insert = (target: object) => (table: unknown) => {
+    if (table === toolAccessAuditEvents) {
+      auditWrites += 1;
+      if (auditWrites > successfulWrites) {
+        return {
+          values: () => {
+            throw new Error("audit write failed");
+          },
+        };
+      }
+    }
+    if (table === toolRuntimeMetricCounters) {
+      options.onMetricCounterWrite?.(inTransaction);
+    }
+    const realInsert = Reflect.get(target, "insert", target) as (
+      value: unknown,
+    ) => unknown;
+    return realInsert.call(target, table);
+  };
   return new Proxy(db, {
     get(target, prop) {
       if (prop === "transaction") {
-        return (callback: (tx: unknown) => Promise<unknown>) =>
-          transaction((tx: unknown) => callback(createAuditFailingTx(tx)));
+        return async (callback: (tx: unknown) => Promise<unknown>) => {
+          inTransaction = true;
+          try {
+            return await transaction((tx: unknown) =>
+              callback(createAuditFailingTx(tx, insert)),
+            );
+          } finally {
+            inTransaction = false;
+          }
+        };
       }
-      if (prop === "insert") return failingAuditInsert(target);
+      if (prop === "insert") return insert(target);
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
   }) as Db;
 }
 
-function createAuditFailingTx(tx: object): object {
+function createAuditFailingTx(
+  tx: object,
+  insert: (target: object) => (table: unknown) => unknown,
+): object {
   return new Proxy(tx, {
     get(target, prop) {
-      if (prop === "insert") return failingAuditInsert(target);
+      if (prop === "insert") return insert(target);
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-}
-
-function failingAuditInsert(target: object) {
-  return (table: unknown) => {
-    if (table === toolAccessAuditEvents) {
-      return {
-        values: () => {
-          throw new Error("audit write failed");
-        },
-      };
-    }
-    const insert = Reflect.get(target, "insert", target) as (
-      value: unknown,
-    ) => unknown;
-    return insert.call(target, table);
-  };
 }
 
 describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
@@ -262,6 +293,7 @@ describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
 
   afterEach(async () => {
     await db.delete(toolGatewayRateLimitCounters);
+    await db.delete(toolRuntimeMetricCounters);
     await db.delete(toolAccessAuditEvents);
     await db.delete(toolMcpGatewayTokens);
     await db.delete(toolMcpGateways);
@@ -900,6 +932,119 @@ describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
     await expect(
       selectAuditRows(db, company.id, "tool_gateway.token_reaped"),
     ).resolves.toHaveLength(0);
+  });
+
+  it("counts an audit write failure only after the transaction released its connection", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const t0 = Date.now();
+    const { token } = await seedGatewayAndToken({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+      expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(t0) })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    let counterWrites = 0;
+    let counterWritesInTransaction = 0;
+    const failingGateway = createToolGatewayService(
+      createAuditFailingDb(db, {
+        onMetricCounterWrite: (inTransaction) => {
+          counterWrites += 1;
+          if (inTransaction) counterWritesInTransaction += 1;
+        },
+      }),
+      { now: Date.now, toolActionSigningSecret: testToolActionSigningSecret },
+    );
+
+    await expect(failingGateway.reapGatewayTokensForDeadRuns()).rejects.toThrow(
+      /audit write failed/,
+    );
+
+    // The failure was counted, and it was counted once the transaction had
+    // released its connection. Counting it inside the transaction would wait
+    // for a connection the transaction itself holds, and the transaction
+    // could not roll back while the count waited.
+    expect(counterWrites).toBeGreaterThan(0);
+    expect(counterWritesInTransaction).toBe(0);
+    await expect(selectTokenRow(db, token.id)).resolves.toBeDefined();
+  });
+
+  it("publishes the reaped activity only after the batch commits", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const t0 = Date.now();
+    const first = await createIssueAndRun(db, company.id, agent.id);
+    const second = await createIssueAndRun(db, company.id, agent.id);
+    const firstToken = await seedGatewayAndToken({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: first.run.id,
+      expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+    });
+    const secondToken = await seedGatewayAndToken({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: second.run.id,
+      expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(t0) })
+      .where(eq(heartbeatRuns.id, first.run.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(t0) })
+      .where(eq(heartbeatRuns.id, second.run.id));
+
+    const published: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(company.id, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as { action?: string } | undefined;
+      if (payload?.action === "tool_gateway.token_reaped") {
+        published.push(payload.action);
+      }
+    });
+    try {
+      // The second token's record cannot be written, so the whole batch rolls
+      // back. Nothing was reaped, so nothing may have been published: a
+      // publication sent before the commit reports a deletion that the
+      // rollback takes back.
+      const failingGateway = createToolGatewayService(
+        createAuditFailingDb(db, { successfulWrites: 1 }),
+        { now: Date.now, toolActionSigningSecret: testToolActionSigningSecret },
+      );
+      await expect(failingGateway.reapGatewayTokensForDeadRuns()).rejects.toThrow(
+        /audit write failed/,
+      );
+      expect(published).toHaveLength(0);
+      await expect(
+        selectTokenRow(db, firstToken.token.id),
+      ).resolves.toBeDefined();
+      await expect(
+        selectTokenRow(db, secondToken.token.id),
+      ).resolves.toBeDefined();
+
+      // A batch that commits publishes, and it publishes once per token.
+      const gateway = createTestToolGatewayService(db, Date.now);
+      await expect(gateway.reapGatewayTokensForDeadRuns()).resolves.toEqual({
+        reapedCount: 2,
+      });
+      expect(published).toHaveLength(2);
+      await expect(
+        selectTokenRow(db, firstToken.token.id),
+      ).resolves.toBeUndefined();
+      await expect(
+        selectTokenRow(db, secondToken.token.id),
+      ).resolves.toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("wakes the reaper when a run token is minted after the queue went empty", async () => {

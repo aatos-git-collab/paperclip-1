@@ -116,7 +116,12 @@ import type {
   AgentToolDescriptor,
   PluginToolDispatcher,
 } from "./plugin-tool-dispatcher.js";
-import { logActivity, type LogActivityInput } from "./activity-log.js";
+import {
+  logActivity,
+  publishActivity,
+  type ActivityPublication,
+  type LogActivityInput,
+} from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
@@ -226,6 +231,21 @@ export const GATEWAY_TOKEN_REAP_INTERVAL_MS = 60 * 1_000;
  * behind them is never examined at all.
  */
 export const GATEWAY_TOKEN_REAP_BATCH_SIZE = 500;
+
+/**
+ * What a transactional caller must hold back until its transaction has ended.
+ *
+ * The activity publication may only say "this token was reaped" once the
+ * deletion is durable: a publication sent before the commit reports a
+ * deletion that a rollback takes back. The audit failure counter may only be
+ * written once the transaction has released its connection: a write that
+ * competes for the pool while the transaction holds it cannot finish, and the
+ * transaction cannot roll back while the write waits.
+ */
+type AuditPostCommit = {
+  publications: ActivityPublication[];
+  auditWriteFailures: string[];
+};
 
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
@@ -1897,6 +1917,8 @@ export function createToolGatewayService(
     // A caller that must not leave a record behind without the write it
     // describes passes its transaction here, so the two commit together.
     executor: Db = db,
+    // A transactional caller holds back what must not escape its transaction.
+    postCommit?: AuditPostCommit,
   ) {
     const dedicatedAuditAction =
       input.action === "tool_gateway.discovery"
@@ -1999,7 +2021,11 @@ export function createToolGatewayService(
         },
       });
     } catch (error) {
-      await recordToolRuntimeAuditWriteFailure(db, input.companyId);
+      // The counter must not be written while the transaction still holds the
+      // connection: the write would wait for a connection the transaction is
+      // holding, and the transaction could not roll back while it waits.
+      if (postCommit) postCommit.auditWriteFailures.push(input.companyId);
+      else await recordToolRuntimeAuditWriteFailure(db, input.companyId);
       throw error;
     }
 
@@ -2040,7 +2066,10 @@ export function createToolGatewayService(
         runId: input.runId,
         ...input.details,
       },
-    });
+    },
+    // A transactional caller publishes after its commit; an ordinary caller
+    // publishes now, as it always has.
+    postCommit?.publications);
   }
 
   async function writeSessionAuthFailure(
@@ -12033,6 +12062,15 @@ export function createToolGatewayService(
       // written for a token that was not removed: a failure inside the
       // transaction rolls the deletion back, and the next sweep collects the
       // token with its record intact.
+      //
+      // What the transaction must not let escape is held here: the activity
+      // publication, which may only report a reaped token once the deletion
+      // has committed, and the audit failure counter, which may only be
+      // written once the transaction has released its connection.
+      const postCommit: AuditPostCommit = {
+        publications: [],
+        auditWriteFailures: [],
+      };
       const reaped = await db.transaction(async (tx) => {
         const executor = tx as unknown as Db;
         const rows = await tx
@@ -12097,10 +12135,31 @@ export function createToolGatewayService(
               },
             },
             executor,
+            postCommit,
           );
         }
         return rows;
+      }).finally(async () => {
+        // The transaction has ended, so its connection is free. The counter
+        // is written here rather than inside the transaction, where it would
+        // wait for a connection the transaction itself holds.
+        for (const companyId of postCommit.auditWriteFailures) {
+          await recordToolRuntimeAuditWriteFailure(db, companyId);
+        }
       });
+      // The batch is committed. Only now may the activity say a token was
+      // reaped: a publication sent before the commit would report a deletion
+      // that a rollback takes back.
+      for (const publication of postCommit.publications) {
+        try {
+          publishActivity(publication);
+        } catch (error) {
+          logger.warn(
+            { err: error },
+            "Gateway token reaping activity publication failed after commit",
+          );
+        }
+      }
       return { reapedCount: reaped.length };
     },
 
