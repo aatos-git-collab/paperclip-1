@@ -218,6 +218,15 @@ export const HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS = 4 * 60 * 60 * 1_000;
  */
 export const GATEWAY_TOKEN_REAP_INTERVAL_MS = 60 * 1_000;
 
+/**
+ * How many dead run tokens one sweep collects.
+ *
+ * The cap is on the collection, never on the read. A cap on the read lets the
+ * oldest live runs' tokens hold the window shut, and a dead run's token
+ * behind them is never examined at all.
+ */
+export const GATEWAY_TOKEN_REAP_BATCH_SIZE = 500;
+
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
   actingUserId: string | null,
@@ -1873,17 +1882,22 @@ export function createToolGatewayService(
     };
   }
 
-  async function writeAudit(input: {
-    session?: ToolGatewaySession | null;
-    companyId: string;
-    agentId: string | null;
-    runId: string | null;
-    issueId: string | null;
-    actorType?: LogActivityInput["actorType"];
-    actorId?: string;
-    action: string;
-    details: Record<string, unknown>;
-  }) {
+  async function writeAudit(
+    input: {
+      session?: ToolGatewaySession | null;
+      companyId: string;
+      agentId: string | null;
+      runId: string | null;
+      issueId: string | null;
+      actorType?: LogActivityInput["actorType"];
+      actorId?: string;
+      action: string;
+      details: Record<string, unknown>;
+    },
+    // A caller that must not leave a record behind without the write it
+    // describes passes its transaction here, so the two commit together.
+    executor: Db = db,
+  ) {
     const dedicatedAuditAction =
       input.action === "tool_gateway.discovery"
         ? "discovery"
@@ -1919,7 +1933,7 @@ export function createToolGatewayService(
         ? input.session.gatewayTokenId
         : typeof input.details.gatewayTokenId === "string" && uuidPattern.test(input.details.gatewayTokenId)
           ? input.details.gatewayTokenId : null;
-      await db.insert(toolAccessAuditEvents).values({
+      await executor.insert(toolAccessAuditEvents).values({
         companyId: input.companyId,
         gatewayId:
           input.session?.gatewayId ??
@@ -1999,7 +2013,7 @@ export function createToolGatewayService(
       input.session?.gatewayId ??
       input.agentId ??
       input.companyId;
-    await logActivity(db, {
+    await logActivity(executor, {
       companyId: input.companyId,
       actorType:
         input.actorType ??
@@ -7101,9 +7115,10 @@ export function createToolGatewayService(
   async function auditRunId(
     companyId: string,
     runId: string | null,
+    executor: Db = db,
   ): Promise<string | null> {
     if (!runId) return null;
-    const [row] = await db
+    const [row] = await executor
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(
@@ -9259,44 +9274,56 @@ export function createToolGatewayService(
       const token = generateNamedGatewayToken(tokenId);
       const tokenPrefix = `pcgw_${tokenId.slice(0, 8)}`;
       const now = new Date();
-      const [row] = await db
-        .insert(toolMcpGatewayTokens)
-        .values({
-          id: tokenId,
-          companyId: input.companyId,
-          gatewayId: input.gatewayId,
-          name: input.body.name,
-          tokenHash: hashGatewayToken(token),
-          tokenPrefix,
-          subjectType: input.body.subjectType ?? "gateway_client",
-          subjectId: input.body.subjectId ?? null,
-          clientLabel: input.body.clientLabel,
-          ownerNote: input.body.ownerNote,
-          allowedActions: input.body.allowedActions ?? [
-            "tools/list",
-            "tools/call",
-            "resources/list",
-            "resources/read",
-            "prompts/list",
-            "prompts/get",
-          ],
-          expiresAt: input.body.expiresAt ?? null,
-          expiryOverrideReason: input.body.expiryOverrideReason ?? null,
-          expiryOverrideByAgentId:
-            input.actor?.agentId && input.body.expiryOverrideReason
-              ? input.actor.agentId
-              : null,
-          expiryOverrideByUserId:
-            input.actor?.userId && input.body.expiryOverrideReason
-              ? input.actor.userId
-              : null,
-          expiryOverrideAt: input.body.expiryOverrideReason ? now : null,
-          createdByAgentId: input.actor?.agentId ?? null,
-          createdByUserId: input.actor?.userId ?? null,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .returning();
+      const subjectType = input.body.subjectType ?? "gateway_client";
+      // A run-scoped token is work the reaper has to notice, and the reaper
+      // is quiet while no run-scoped token exists. The intent is registered
+      // on this transaction, before the token is written, so the reaper's
+      // worker wakes on the token's arrival instead of waiting for its next
+      // poll. An operator token is not the reaper's business and says nothing.
+      const row = await db.transaction(async (tx) => {
+        if (subjectType === "heartbeat_run") {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.gatewayRunTokens);
+        }
+        const [inserted] = await tx
+          .insert(toolMcpGatewayTokens)
+          .values({
+            id: tokenId,
+            companyId: input.companyId,
+            gatewayId: input.gatewayId,
+            name: input.body.name,
+            tokenHash: hashGatewayToken(token),
+            tokenPrefix,
+            subjectType,
+            subjectId: input.body.subjectId ?? null,
+            clientLabel: input.body.clientLabel,
+            ownerNote: input.body.ownerNote,
+            allowedActions: input.body.allowedActions ?? [
+              "tools/list",
+              "tools/call",
+              "resources/list",
+              "resources/read",
+              "prompts/list",
+              "prompts/get",
+            ],
+            expiresAt: input.body.expiresAt ?? null,
+            expiryOverrideReason: input.body.expiryOverrideReason ?? null,
+            expiryOverrideByAgentId:
+              input.actor?.agentId && input.body.expiryOverrideReason
+                ? input.actor.agentId
+                : null,
+            expiryOverrideByUserId:
+              input.actor?.userId && input.body.expiryOverrideReason
+                ? input.actor.userId
+                : null,
+            expiryOverrideAt: input.body.expiryOverrideReason ? now : null,
+            createdByAgentId: input.actor?.agentId ?? null,
+            createdByUserId: input.actor?.userId ?? null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        return inserted;
+      });
       // The reaper deletes a token row once its idle window lapses. This audit
       // row is the durable record of what the token was, so a reaped run
       // token is still told apart from an unknown bearer.
@@ -11909,6 +11936,11 @@ export function createToolGatewayService(
     // holds with the scheduler disabled and on a warm standby.
     async reapGatewayTokensForDeadRuns(input: { now?: Date } = {}) {
       const now = input.now ?? new Date();
+      // Every run-scoped token is a candidate, and the read is deliberately
+      // not capped. A cap on the read lets the oldest live runs' tokens hold
+      // the window shut: the same rows come back on every pass, so a dead
+      // run's token behind them is never examined and never collected. The
+      // cap is on the collection instead, where it cannot hide a dead token.
       const candidates = await db
         .select({
           id: toolMcpGatewayTokens.id,
@@ -11929,8 +11961,7 @@ export function createToolGatewayService(
           eq(toolMcpGatewayTokens.gatewayId, toolMcpGateways.id),
         )
         .where(eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"))
-        .orderBy(asc(toolMcpGatewayTokens.createdAt), asc(toolMcpGatewayTokens.id))
-        .limit(500);
+        .orderBy(asc(toolMcpGatewayTokens.createdAt), asc(toolMcpGatewayTokens.id));
       if (candidates.length === 0) return { reapedCount: 0 };
       const runIds = [
         ...new Set(
@@ -11942,26 +11973,34 @@ export function createToolGatewayService(
             ),
         ),
       ];
-      const runs = runIds.length
-        ? await db
-            .select({
-              id: heartbeatRuns.id,
-              companyId: heartbeatRuns.companyId,
-              status: heartbeatRuns.status,
-              runtimeMode: heartbeatRuns.runtimeMode,
-              controllerBootId: heartbeatRuns.controllerBootId,
-              controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
-              nativeControllerBootId: nativeRunFinalizations.controllerBootId,
-              nativeLeaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
-            })
-            .from(heartbeatRuns)
-            .leftJoin(
-              nativeRunFinalizations,
-              eq(nativeRunFinalizations.runId, heartbeatRuns.id),
-            )
-            .where(inArray(heartbeatRuns.id, runIds))
-        : [];
-      const runsById = new Map(runs.map((run) => [run.id, run]));
+      // The runs are read in chunks so the lookup stays inside the driver's
+      // bound on statement parameters however many run tokens exist.
+      const runsById = new Map<string, GatewayRunLiveness>();
+      for (
+        let index = 0;
+        index < runIds.length;
+        index += GATEWAY_TOKEN_REAP_BATCH_SIZE
+      ) {
+        const chunk = runIds.slice(index, index + GATEWAY_TOKEN_REAP_BATCH_SIZE);
+        const rows = await db
+          .select({
+            id: heartbeatRuns.id,
+            companyId: heartbeatRuns.companyId,
+            status: heartbeatRuns.status,
+            runtimeMode: heartbeatRuns.runtimeMode,
+            controllerBootId: heartbeatRuns.controllerBootId,
+            controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+            nativeControllerBootId: nativeRunFinalizations.controllerBootId,
+            nativeLeaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
+          })
+          .from(heartbeatRuns)
+          .leftJoin(
+            nativeRunFinalizations,
+            eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+          )
+          .where(inArray(heartbeatRuns.id, chunk));
+        for (const row of rows) runsById.set(row.id, row);
+      }
       const dead = candidates
         .map((token) => {
           const run = token.subjectId
@@ -11979,66 +12018,89 @@ export function createToolGatewayService(
           } => entry !== null,
         );
       if (dead.length === 0) return { reapedCount: 0 };
-      const reaped = await db
-        .delete(toolMcpGatewayTokens)
-        .where(
-          and(
-            inArray(
-              toolMcpGatewayTokens.id,
-              dead.map((entry) => entry.token.id),
-            ),
-            eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
-          ),
-        )
-        .returning({
-          id: toolMcpGatewayTokens.id,
-          companyId: toolMcpGatewayTokens.companyId,
-          subjectId: toolMcpGatewayTokens.subjectId,
-          expiresAt: toolMcpGatewayTokens.expiresAt,
-        });
-      const reasonsById = new Map(
-        dead.map((entry) => [entry.token.id, entry.reason]),
+      // One sweep collects at most a batch. The tokens that did not fit are
+      // dead all the same, and the next sweep finds them again, so the cap
+      // delays a collection rather than losing one.
+      const batch = dead.slice(0, GATEWAY_TOKEN_REAP_BATCH_SIZE);
+      const candidatesById = new Map(
+        candidates.map((entry) => [entry.id, entry]),
       );
-      for (const token of reaped) {
-        const candidate = candidates.find((entry) => entry.id === token.id);
-        const gatewayId = candidate?.gatewayId ?? null;
-        // The reaping is its own audit row, so "this token was reaped, and
-        // this is why" is durable and does not have to be inferred from a
-        // missing row.
-        await writeAudit({
-          session: {
-            id: `gateway:${gatewayId ?? token.id}`,
-            token: "",
-            companyId: token.companyId,
-            agentId: candidate?.gatewayAgentId ?? null,
-            runId: token.subjectId,
-            issueId: candidate?.gatewayIssueId ?? null,
-            projectId: candidate?.gatewayProjectId ?? null,
-            gatewayId,
-            gatewayPublicId: candidate?.gatewayPublicId ?? null,
-            gatewayName: candidate?.gatewayName ?? null,
-            gatewayTokenId: token.id,
-            actorType: "system",
-            actorId: gatewayId ?? token.id,
-            createdAt: now,
-            expiresAt: token.expiresAt ?? now,
-          },
-          companyId: token.companyId,
-          agentId: candidate?.gatewayAgentId ?? null,
-          runId: await auditRunId(token.companyId, token.subjectId),
-          issueId: candidate?.gatewayIssueId ?? null,
-          action: "tool_gateway.token_reaped",
-          details: {
-            decision: "allow",
-            reasonCode: "run_token_reaped",
-            reapReason: reasonsById.get(token.id) ?? "run_not_active",
-            subjectType: "heartbeat_run",
-            runId: token.subjectId,
-            gatewayTokenId: token.id,
-            expiresAt: token.expiresAt?.toISOString() ?? null,
-          },
-        });
-      }
+      const reasonsById = new Map(
+        batch.map((entry) => [entry.token.id, entry.reason]),
+      );
+      // The audit rows and the deletion commit together. A token is never
+      // removed without the record that says why, and a record is never
+      // written for a token that was not removed: a failure inside the
+      // transaction rolls the deletion back, and the next sweep collects the
+      // token with its record intact.
+      const reaped = await db.transaction(async (tx) => {
+        const executor = tx as unknown as Db;
+        const rows = await tx
+          .delete(toolMcpGatewayTokens)
+          .where(
+            and(
+              inArray(
+                toolMcpGatewayTokens.id,
+                batch.map((entry) => entry.token.id),
+              ),
+              eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
+            ),
+          )
+          .returning({
+            id: toolMcpGatewayTokens.id,
+            companyId: toolMcpGatewayTokens.companyId,
+            subjectId: toolMcpGatewayTokens.subjectId,
+            expiresAt: toolMcpGatewayTokens.expiresAt,
+          });
+        for (const token of rows) {
+          const candidate = candidatesById.get(token.id);
+          const gatewayId = candidate?.gatewayId ?? null;
+          // The reaping is its own audit row, so "this token was reaped, and
+          // this is why" is durable and does not have to be inferred from a
+          // missing row.
+          await writeAudit(
+            {
+              session: {
+                id: `gateway:${gatewayId ?? token.id}`,
+                token: "",
+                companyId: token.companyId,
+                agentId: candidate?.gatewayAgentId ?? null,
+                runId: token.subjectId,
+                issueId: candidate?.gatewayIssueId ?? null,
+                projectId: candidate?.gatewayProjectId ?? null,
+                gatewayId,
+                gatewayPublicId: candidate?.gatewayPublicId ?? null,
+                gatewayName: candidate?.gatewayName ?? null,
+                gatewayTokenId: token.id,
+                actorType: "system",
+                actorId: gatewayId ?? token.id,
+                createdAt: now,
+                expiresAt: token.expiresAt ?? now,
+              },
+              companyId: token.companyId,
+              agentId: candidate?.gatewayAgentId ?? null,
+              runId: await auditRunId(
+                token.companyId,
+                token.subjectId,
+                executor,
+              ),
+              issueId: candidate?.gatewayIssueId ?? null,
+              action: "tool_gateway.token_reaped",
+              details: {
+                decision: "allow",
+                reasonCode: "run_token_reaped",
+                reapReason: reasonsById.get(token.id) ?? "run_not_active",
+                subjectType: "heartbeat_run",
+                runId: token.subjectId,
+                gatewayTokenId: token.id,
+                expiresAt: token.expiresAt?.toISOString() ?? null,
+              },
+            },
+            executor,
+          );
+        }
+        return rows;
+      });
       return { reapedCount: reaped.length };
     },
 

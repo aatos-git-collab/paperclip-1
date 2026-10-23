@@ -21,9 +21,13 @@ import {
 } from "@paperclipai/db";
 import {
   createToolGatewayService,
+  GATEWAY_TOKEN_REAP_BATCH_SIZE,
+  GATEWAY_TOKEN_REAP_INTERVAL_MS,
   HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS,
   ToolGatewayHttpError,
 } from "../services/tool-gateway.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -186,6 +190,65 @@ async function expectGatewayError(
   expect(gatewayError.status).toBe(status);
   expect(gatewayError.reasonCode).toBe(reasonCode);
   return gatewayError;
+}
+
+async function waitFor(
+  predicate: () => Promise<boolean>,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for the reaper to collect the token");
+}
+
+/**
+ * A database whose audit writes fail, so a reaper that deletes before it
+ * records can be caught. Every other write behaves normally.
+ */
+function createAuditFailingDb(db: Db): Db {
+  const transaction = db.transaction.bind(db) as (
+    callback: (tx: unknown) => Promise<unknown>,
+  ) => Promise<unknown>;
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop === "transaction") {
+        return (callback: (tx: unknown) => Promise<unknown>) =>
+          transaction((tx: unknown) => callback(createAuditFailingTx(tx)));
+      }
+      if (prop === "insert") return failingAuditInsert(target);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Db;
+}
+
+function createAuditFailingTx(tx: object): object {
+  return new Proxy(tx, {
+    get(target, prop) {
+      if (prop === "insert") return failingAuditInsert(target);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function failingAuditInsert(target: object) {
+  return (table: unknown) => {
+    if (table === toolAccessAuditEvents) {
+      return {
+        values: () => {
+          throw new Error("audit write failed");
+        },
+      };
+    }
+    const insert = Reflect.get(target, "insert", target) as (
+      value: unknown,
+    ) => unknown;
+    return insert.call(target, table);
+  };
 }
 
 describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
@@ -711,6 +774,239 @@ describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
     ).toEqual([false, true]);
   });
 
+  it("reaps a dead run token that sits behind more live tokens than one batch holds", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const t0 = Date.now();
+    const profile = await createProfile(db, company.id, agent.id);
+    const gateway = createTestToolGatewayService(db, Date.now);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Run liveness gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+
+    // More live run tokens than one collection batch holds, every one of them
+    // created before the dead one. A sweep that capped its read would keep
+    // re-reading exactly these rows and never reach the dead token behind
+    // them, so the dead token would never be collected at all.
+    const liveRuns = await db
+      .insert(heartbeatRuns)
+      .values(
+        Array.from({ length: GATEWAY_TOKEN_REAP_BATCH_SIZE + 1 }, () => ({
+          companyId: company.id,
+          agentId: agent.id,
+          invocationSource: "assignment",
+          status: "running",
+        })),
+      )
+      .returning({ id: heartbeatRuns.id });
+    const [deadRun] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId: company.id,
+        agentId: agent.id,
+        invocationSource: "assignment",
+        status: "succeeded",
+        finishedAt: new Date(t0),
+      })
+      .returning({ id: heartbeatRuns.id });
+    const deadTokenId = randomUUID();
+
+    const liveTokenValues: (typeof toolMcpGatewayTokens.$inferInsert)[] =
+      liveRuns.map((run) => ({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        name: `Live run token ${run.id}`,
+        tokenHash: `live-${run.id}`,
+        tokenPrefix: `pcgw_${run.id.slice(0, 8)}`,
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        clientLabel: "Heartbeat runtime",
+        ownerNote: "Live run token",
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+        createdAt: new Date(t0),
+        updatedAt: new Date(t0),
+      }));
+    const deadTokenValues: (typeof toolMcpGatewayTokens.$inferInsert)[] = [
+      {
+        id: deadTokenId,
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        name: "Dead run token",
+        tokenHash: `dead-${deadRun!.id}`,
+        tokenPrefix: `pcgw_${deadRun!.id.slice(0, 8)}`,
+        subjectType: "heartbeat_run",
+        subjectId: deadRun!.id,
+        clientLabel: "Heartbeat runtime",
+        ownerNote: "Dead run token",
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+        createdAt: new Date(t0 + 1_000),
+        updatedAt: new Date(t0 + 1_000),
+      },
+    ];
+    await db
+      .insert(toolMcpGatewayTokens)
+      .values([...liveTokenValues, ...deadTokenValues]);
+
+    // The dead token is collected even though it sits behind more live tokens
+    // than one batch holds.
+    await expect(gateway.reapGatewayTokensForDeadRuns()).resolves.toEqual({
+      reapedCount: 1,
+    });
+    await expect(selectTokenRow(db, deadTokenId)).resolves.toBeUndefined();
+
+    const remaining = await db
+      .select({ id: toolMcpGatewayTokens.id })
+      .from(toolMcpGatewayTokens)
+      .where(eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"));
+    expect(remaining).toHaveLength(GATEWAY_TOKEN_REAP_BATCH_SIZE + 1);
+  });
+
+  it("leaves the token in place when the audit record cannot be written", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const t0 = Date.now();
+    const { token } = await seedGatewayAndToken({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+      expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(t0) })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const failingGateway = createToolGatewayService(createAuditFailingDb(db), {
+      now: Date.now,
+      toolActionSigningSecret: testToolActionSigningSecret,
+    });
+
+    // The record and the deletion commit together. A token is never removed
+    // without the record that says why, so a record that cannot be written
+    // leaves the token in place and the next sweep collects it with its
+    // record intact.
+    await expect(failingGateway.reapGatewayTokensForDeadRuns()).rejects.toThrow(
+      /audit write failed/,
+    );
+    await expect(selectTokenRow(db, token.id)).resolves.toBeDefined();
+    await expect(
+      selectAuditRows(db, company.id, "tool_gateway.token_reaped"),
+    ).resolves.toHaveLength(0);
+  });
+
+  it("wakes the reaper when a run token is minted after the queue went empty", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id, "succeeded");
+    const t0 = Date.now();
+    const profile = await createProfile(db, company.id, agent.id);
+    const gateway = createTestToolGatewayService(db, Date.now);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Run liveness gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+
+    const coordinator = createDeliveryWorkCoordinator({
+      owner: db,
+      canRun: () => true,
+      canReconcile: () => true,
+      onError: () => {},
+    });
+    let runs = 0;
+    const delivery = coordinator.register(DELIVERY_QUEUES.gatewayRunTokens, {
+      retryMs: GATEWAY_TOKEN_REAP_INTERVAL_MS,
+      run: async () => {
+        runs += 1;
+        return gateway.reapGatewayTokensForDeadRuns();
+      },
+      hasPending: () => gateway.hasOutstandingGatewayRunTokens(),
+      runDuringDrain: true,
+    });
+    try {
+      await delivery.ready;
+      // The queue holds nothing, so the duty has gone quiet.
+      expect(runs).toBe(1);
+
+      // A run token minted now is work the reaper has to notice. The mint
+      // registers that intent on its own transaction, so the quiet duty wakes
+      // up for it instead of waiting for its next poll.
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Late run token",
+          subjectType: "heartbeat_run",
+          subjectId: run.id,
+          clientLabel: "Heartbeat runtime",
+          ownerNote: "Minted after the reaper went quiet",
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(t0 + HEARTBEAT_RUN_TOKEN_IDLE_WINDOW_MS),
+        },
+        actor: { agentId: agent.id },
+      });
+
+      await waitFor(async () => (await selectTokenRow(db, token.id)) === undefined);
+      expect(runs).toBeGreaterThan(1);
+    } finally {
+      await coordinator.stop();
+    }
+  });
+
+  it("runs the reaper's duty on a warm standby", async () => {
+    // A warm standby holds every duty back, because the work belongs to the
+    // instance that owns it. A leftover credential is not that instance's to
+    // keep, so the duty that collects it says so, and every other duty stays
+    // held back.
+    const coordinator = createDeliveryWorkCoordinator({
+      owner: db,
+      canRun: () => false,
+      canReconcile: () => false,
+      onError: () => {},
+    });
+    let standbyRuns = 0;
+    let heldRuns = 0;
+    try {
+      const standby = coordinator.register(DELIVERY_QUEUES.gatewayRunTokens, {
+        retryMs: GATEWAY_TOKEN_REAP_INTERVAL_MS,
+        run: async () => {
+          standbyRuns += 1;
+          return { reapedCount: 0 };
+        },
+        hasPending: async () => false,
+        runDuringDrain: true,
+        runOnStandby: true,
+      });
+      await standby.ready;
+      expect(standbyRuns).toBe(1);
+
+      const held = coordinator.register(DELIVERY_QUEUES.toolAction, {
+        retryMs: GATEWAY_TOKEN_REAP_INTERVAL_MS,
+        run: async () => {
+          heldRuns += 1;
+          return { reapedCount: 0 };
+        },
+        hasPending: async () => false,
+        runDuringDrain: true,
+      });
+      await held.ready;
+      expect(heldRuns).toBe(0);
+    } finally {
+      await coordinator.stop();
+    }
+  });
+
   it("runs the run-token reaper on the shared delivery coordinator, not on the heartbeat scheduler", () => {
     const source = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
 
@@ -729,6 +1025,10 @@ describeEmbeddedPostgres("run scoped MCP gateway token liveness reaper", () => {
     );
     expect(registerBlock).toContain("reapGatewayTokensForDeadRuns");
     expect(registerBlock).toContain("hasOutstandingGatewayRunTokens");
+    // The standby holds the duty back like every other duty, except for this
+    // one: a credential left behind by a run that ended is not the standby's
+    // to keep.
+    expect(registerBlock).toContain("runOnStandby: true");
     expect(registerBlock).not.toContain("isWarmStandby");
     expect(registerBlock).not.toContain("heartbeatSchedulerEnabled");
     expect(registerBlock).not.toContain("heartbeatSchedulerStopped");

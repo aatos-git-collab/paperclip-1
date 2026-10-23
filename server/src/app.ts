@@ -1289,11 +1289,16 @@ export async function createApp(
   // and can be turned off, and neither may leave a finished run's token in
   // place. The duty is quiet while no run-scoped token exists, and it keeps
   // running through an idle drain so a drain cannot strand a dead credential.
+  // A warm standby holds the duty back like every other duty, but the token it
+  // would collect is not that instance's to keep: a run that ended on the
+  // primary must not leave its credential behind because the instance that
+  // took over is standing by.
   deliveryWork.register(DELIVERY_QUEUES.gatewayRunTokens, {
     retryMs: GATEWAY_TOKEN_REAP_INTERVAL_MS,
     run: () => toolGateway.reapGatewayTokensForDeadRuns(),
     hasPending: () => toolGateway.hasOutstandingGatewayRunTokens(),
     runDuringDrain: true,
+    runOnStandby: true,
   });
   publicMcpEvents?.start(deliveryWork);
   dotMcpEvents?.start(deliveryWork);
